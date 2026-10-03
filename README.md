@@ -8,7 +8,7 @@ Connect a **Windows or macOS laptop** to an **Azure Ubuntu VM with no public IP*
 
 ```mermaid
 flowchart TB
-    Laptop[Windows / macOS laptop\nAzure VPN Client] -->|Internet: OpenVPN encrypted tunnel| GW[Azure VPN Gateway\nVpnGw1 + Public IP]
+    Laptop[Windows / macOS laptop\nAzure VPN Client] -->|Internet: OpenVPN encrypted tunnel| GW[Azure VPN Gateway\nVpnGw1AZ + zone-redundant Public IP]
     Entra[Microsoft Entra ID] -.->|VPN user authentication| Laptop
     subgraph VNET[Azure VNet 10.0.0.0/16]
       GW --- GS[GatewaySubnet\n10.0.1.0/27]
@@ -17,19 +17,52 @@ flowchart TB
     Laptop -.->|VPN client address: 172.16.0.0/24| GW
 ```
 
-| Resource | Value |
-|---|---|
-| Resource group | `rg-p2s-lab` |
-| Region | `centralindia` |
-| VNet | `vnet-p2s` — `10.0.0.0/16` |
-| VM subnet | `vm-subnet` — `10.0.2.0/24` |
-| Gateway subnet | `GatewaySubnet` — `10.0.1.0/27` |
-| VPN client address pool | `172.16.0.0/24` |
-| VPN Gateway | `vpngw-p2s`, `VpnGw1`, route-based |
-| VM | `vm-p2s`, Ubuntu 24.04, `10.0.2.4` |
-| Protocol / authentication | OpenVPN (SSL) / Microsoft Entra ID |
+| Resource                  | Value                                |
+| ------------------------- | ------------------------------------ |
+| Resource group            | `rg-p2s-lab`                         |
+| Region                    | `centralindia`                       |
+| VNet                      | `vnet-p2s` — `10.0.0.0/16`           |
+| VM subnet                 | `vm-subnet` — `10.0.2.0/24`          |
+| Gateway subnet            | `GatewaySubnet` — `10.0.1.0/27`      |
+| VPN client address pool   | `172.16.0.0/24`                      |
+| VPN Gateway               | `vpngw-p2s`, `VpnGw1AZ`, route-based |
+| VM                        | `vm-p2s`, Ubuntu 24.04, `10.0.2.4`   |
+| Protocol / authentication | OpenVPN (SSL) / Microsoft Entra ID   |
 
-**Prerequisites:** Azure subscription with appropriate permissions, Azure CLI (or Azure Cloud Shell Bash), a Microsoft Entra tenant, Azure VPN Client on your laptop, and SSH. Ensure the address ranges do not overlap with your local network or other VPNs. `VpnGw1` availability and VM sizes vary by subscription and region.
+**Prerequisites:** Azure subscription with appropriate permissions, Azure CLI (or Azure Cloud Shell Bash), a Microsoft Entra tenant, Azure VPN Client on your laptop, and SSH. Ensure the address ranges do not overlap with your local network or other VPNs. `VpnGw1AZ` availability and VM sizes vary by subscription and region.
+
+## Automated deployment
+
+For macOS, Linux, or Azure Cloud Shell Bash, use the deployment script to create the resource group, VNet and subnets, NSG, private Ubuntu VM, VPN gateway, and P2S Entra ID configuration. This is an alternative to manually running sections 2–7 below; do not run both paths against the same resource group.
+
+The `VpnGw1AZ` gateway is billable while provisioned and can take 30–60 minutes or longer to finish. Review the resource names, region, address ranges, and VM size in `deploy.sh` before proceeding. The selected region must support availability zones. Ensure the VNet and VPN client ranges do not overlap with networks you connect from.
+
+```bash
+az login
+az account list -o table
+export AZURE_SUBSCRIPTION_ID="YOUR_SUBSCRIPTION_ID"
+bash deploy.sh --confirm-create
+```
+
+The script defaults to `centralindia`, `rg-p2s-lab`, `VpnGw1AZ`, a `Standard_B2s_v2` VM, and the address ranges shown in the architecture table. Azure VM capacity can change; if Azure reports `SkuNotAvailable`, choose a listed size for the region and retry with `P2S_VM_SIZE` set. For example:
+
+```bash
+export P2S_LOCATION="eastus"
+export P2S_RESOURCE_GROUP="rg-my-p2s-lab"
+export P2S_VNET_CIDR="10.20.0.0/16"
+export P2S_VM_SUBNET_CIDR="10.20.2.0/24"
+export P2S_GATEWAY_SUBNET_CIDR="10.20.1.0/27"
+export P2S_CLIENT_POOL="172.20.0.0/24"
+P2S_VM_SIZE="Standard_B2as_v2" bash deploy.sh --confirm-create
+```
+
+The deployment script creates an SSH key at `~/.ssh/p2s_lab_key` if one does not already exist. Keep the private key on your laptop; if running in Cloud Shell, transfer it securely before SSH testing. After gateway provisioning succeeds, continue at section 8 to download/import the Azure VPN Client profile, then use sections 9–14 to test and clean up. For a manual deployment, continue with section 2 instead.
+
+If an earlier run created the old unattached gateway IP without zones, rerun with `--replace-unattached-public-ip` to replace it. The script checks that the IP is unattached before deleting it; it will refuse to replace an attached IP.
+
+```bash
+bash deploy.sh --confirm-create --replace-unattached-public-ip
+```
 
 ## 2. Sign in and set variables
 
@@ -121,7 +154,7 @@ az vm create \
   --name "$VM" \
   --location "$LOCATION" \
   --image Ubuntu2404 \
-  --size Standard_B2s \
+  --size Standard_B2s_v2 \
   --admin-username azureuser \
   --ssh-key-values ~/.ssh/p2s_lab_key.pub \
   --vnet-name "$VNET" \
@@ -139,7 +172,7 @@ az vm create \
 #   --subnet "$VM_SUBNET" --network-security-group "$NSG" \
 #   --private-ip-address "$VM_IP"
 # az vm create -g "$RG" -n "$VM" --location "$LOCATION" \
-#   --image Ubuntu2404 --size Standard_B2s --admin-username azureuser \
+#   --image Ubuntu2404 --size Standard_B2s_v2 --admin-username azureuser \
 #   --ssh-key-values ~/.ssh/p2s_lab_key.pub --nics nic-p2s-vm
 ```
 
@@ -160,7 +193,7 @@ The gateway has a public IP for the VPN connection. **The VM does not.**
 az network public-ip create \
   --resource-group "$RG" --name "$PIP" \
   --location "$LOCATION" --sku Standard \
-  --allocation-method Static
+  --allocation-method Static --zone 1 2 3
 
 az network vnet-gateway create \
   --resource-group "$RG" \
@@ -170,7 +203,7 @@ az network vnet-gateway create \
   --public-ip-addresses "$PIP" \
   --gateway-type Vpn \
   --vpn-type RouteBased \
-  --sku VpnGw1
+  --sku VpnGw1AZ
 ```
 
 Provisioning often takes 30–60 minutes or more. Check status:
@@ -288,14 +321,15 @@ Expected: `Azure P2S VPN Lab Successful`.
 
 ## 12. Troubleshooting
 
-| Symptom | Checks |
-|---|---|
-| Gateway stuck deploying | Wait; check deployment operations, quota, SKU and region |
-| Azure VPN Client fails to sign in | Entra tenant, Audience, Issuer, consent and imported profile |
-| VPN connects but SSH times out | Route to VNet, correct private IP, NSG source `172.16.0.0/24`, SSH daemon |
-| HTTP fails but SSH works | `sudo systemctl status nginx`; NSG port 80; VM firewall |
-| Laptop routes incorrectly | Overlapping home/office/VPN address ranges |
-| Ping fails | ICMP can be blocked; test TCP 22 or 80 instead |
+| Symptom                            | Checks                                                                    |
+| ---------------------------------- | ------------------------------------------------------------------------- |
+| Gateway stuck deploying            | Wait; check deployment operations, quota, SKU and region                  |
+| `NonAzSkusNotAllowedForVPNGateway` | Use `VpnGw1AZ` and a Standard public IP explicitly zoned across `1 2 3`   |
+| Azure VPN Client fails to sign in  | Entra tenant, Audience, Issuer, consent and imported profile              |
+| VPN connects but SSH times out     | Route to VNet, correct private IP, NSG source `172.16.0.0/24`, SSH daemon |
+| HTTP fails but SSH works           | `sudo systemctl status nginx`; NSG port 80; VM firewall                   |
+| Laptop routes incorrectly          | Overlapping home/office/VPN address ranges                                |
+| Ping fails                         | ICMP can be blocked; test TCP 22 or 80 instead                            |
 
 Helpful diagnostics:
 
